@@ -80,6 +80,9 @@ class Settings:
     log_level: str
     gc_disable: bool
     connection_timeout: float = 5.0
+    # How long to wait for the discussion auto-forward when a channel update
+    # arrives before it (one retry of getDiscussionMessage, never a loop).
+    resolve_grace_ms: int = 300
 
     @property
     def uses_string_session(self) -> bool:
@@ -128,4 +131,5 @@ def load_settings(env_file: Path | None = None) -> Settings:
         command_chat_ids=_chat_ids("COMMAND_CHAT_IDS"),
         log_level=os.environ.get("LOG_LEVEL", "INFO").strip().upper() or "INFO",
         gc_disable=_flag("GC_DISABLE", False),
+        resolve_grace_ms=max(0, _integer("RESOLVE_GRACE_MS", 300)),
     )

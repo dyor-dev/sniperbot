@@ -75,6 +75,7 @@ def fake_settings(**overrides):
         words=("salom",),
         gc_disable=False,
         log_level="INFO",
+        resolve_grace_ms=0,
         session_string="",
         session_file=Path("x.session"),
         state_file=Path("state.json"),
@@ -101,6 +102,32 @@ class FakeClient:
     async def send_message(self, entity, text, **kwargs):
         self.messages.append(text)
         return SimpleNamespace(id=1)
+
+
+class ResolveClient(FakeClient):
+    """getDiscussionMessage answers change over time, like the real server."""
+
+    def __init__(self, replies=()):
+        super().__init__()
+        self.replies = list(replies)
+
+    async def __call__(self, request):
+        self.requests.append(request)
+        if type(request).__name__ != "GetDiscussionMessageRequest":
+            return SimpleNamespace()
+        reply = self.replies.pop(0) if self.replies else None
+        if isinstance(reply, BaseException):
+            raise reply
+        if reply is None:  # auto-forward not created yet -> empty update
+            return SimpleNamespace(messages=[], chats=[])
+        return reply
+
+
+def discussion_reply(group_id=222, group_hash=6, message_id=777):
+    return SimpleNamespace(
+        messages=[SimpleNamespace(id=message_id, peer_id=SimpleNamespace(channel_id=group_id))],
+        chats=[SimpleNamespace(id=group_id, access_hash=group_hash)],
+    )
 
 
 # --------------------------------------------------------------------------- words
@@ -317,7 +344,7 @@ class TestStore(unittest.TestCase):
 class TestCommentPath(unittest.TestCase):
     """Exercises Sniper._comment end to end against a fake client."""
 
-    def build(self, error=None, enabled=True, words=("salom",)):
+    def build(self, error=None, enabled=True, words=("salom",), client=None):
         from sniper.hotpath import Sniper
 
         store = Store(Path(tempfile.mkdtemp()) / "state.json")
@@ -332,7 +359,7 @@ class TestCommentPath(unittest.TestCase):
                 group_hash=6,
             )
         )
-        client = FakeClient(error)
+        client = client or FakeClient(error)
         metrics = Metrics()
         sniper = Sniper(client, fake_settings(), store, metrics, self_id=1)
         return sniper, client, metrics, store
@@ -396,11 +423,43 @@ class TestCommentPath(unittest.TestCase):
         self.assertEqual(metrics.skipped.get("slow_mode"), 1)
         self.assertGreater(sniper.frozen_until, time.monotonic())
 
-    def test_direct_hit_skips_when_resolution_fails(self):
-        sniper, _, metrics, _ = self.build(error=errors.RPCError(None, "X"))
+    def test_direct_hit_retries_once_the_auto_forward_exists(self):
+        # A channel update can beat the auto-forward into the group: the first
+        # getDiscussionMessage is empty, the second (after the grace) is not.
+        sniper, client, metrics, store = self.build(
+            client=ResolveClient([None, discussion_reply()])
+        )
+        self.run_hit(sniper, hit=PostHit("direct", 111, 0, 50, 0))
+        self.assertEqual(metrics.comments, 1)
+        # two getDiscussionMessage calls, then the one sendMessage
+        self.assertEqual(
+            [type(r).__name__ for r in client.requests],
+            ["GetDiscussionMessageRequest", "GetDiscussionMessageRequest", "SendMessageRequest"],
+        )
+        self.assertEqual(client.requests[2].reply_to.reply_to_msg_id, 777)
+        self.assertEqual(store.state.channels["kanal"].last_error, "")
+
+    def test_unresolved_post_is_released_for_the_group_update(self):
+        sniper, _, metrics, _ = self.build(client=ResolveClient([None, None]))
         self.run_hit(sniper, hit=PostHit("direct", 111, 0, 50, 0))
         self.assertEqual(metrics.skipped.get("unresolved"), 1)
-        self.assertEqual(metrics.comments, 0)
+        # the auto-forward shows up late - the same post must still get through
+        self.run_hit(sniper, hit=PostHit("discussion", 111, 222, 50, 777))
+        self.assertEqual(metrics.comments, 1)
+
+    def test_resolve_flood_cools_down_without_freezing_comments(self):
+        sniper, client, metrics, store = self.build(
+            client=ResolveClient([errors.FloodWaitError(None, capture=2)])
+        )
+        self.run_hit(sniper, hit=PostHit("direct", 111, 0, 50, 0))
+        self.assertEqual(metrics.flood_waits, 1)
+        self.assertGreater(sniper.resolve_until, time.monotonic())
+        self.assertEqual(sniper.frozen_until, 0.0)  # sendMessage is not blocked
+        self.assertEqual(len(client.requests), 1)  # no retry while cooling down
+        self.assertIn("GetDiscussionMessage", store.state.channels["kanal"].last_error)
+        # the next post must not burn the throttled method again
+        self.run_hit(sniper, hit=PostHit("direct", 111, 0, 51, 0))
+        self.assertEqual(len(client.requests), 1)
 
     def test_send_failure_keeps_the_reason_on_the_channel(self):
         # Without this the user only sees "xato 3" and cannot tell why.

@@ -15,6 +15,7 @@ Design rules that keep the reaction time network-bound instead of CPU-bound:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
 import time
@@ -48,6 +49,7 @@ class Sniper:
         "gate",
         "_done",
         "frozen_until",
+        "resolve_until",
     )
 
     def __init__(
@@ -68,6 +70,9 @@ class Sniper:
         self.gate = gate or Gate(settings.min_interval, settings.max_per_minute)
         self._done: dict[tuple[int, int], int] = {}
         self.frozen_until = 0.0
+        # Method-scoped cooldown for getDiscussionMessage. It is a separate
+        # budget from sendMessage, so it must never freeze commenting.
+        self.resolve_until = 0.0
 
     # ------------------------------------------------------------- entry point
     async def on_update(self, update: Any) -> None:
@@ -134,9 +139,17 @@ class Sniper:
 
         if group_peer is None or not reply_to:
             group_peer, reply_to = await self._resolve(rec, hit.post_id)
+            if group_peer is None and time.monotonic() >= self.resolve_until:
+                # The channel update can overtake the auto-forward into the
+                # linked group, so the discussion message does not exist yet.
+                # Wait a little and ask once more instead of losing the post.
+                await asyncio.sleep(self.settings.resolve_grace_ms / 1000.0)
+                group_peer, reply_to = await self._resolve(rec, hit.post_id)
             if group_peer is None or not reply_to:
+                # Release the post: a group update that shows up later can still
+                # comment on it, and a stale claim would silently eat it.
+                self._done.pop(done_key, None)
                 metrics.skip("unresolved")
-                rec.last_error = rec.last_error or "muhokama guruhi aniqlanmadi"
                 return
 
         text, cursor = pick(state.words, state.cursor)
@@ -195,6 +208,11 @@ class Sniper:
     # ------------------------------------------------------------- slow helpers
     async def _resolve(self, rec: Any, post_id: int):
         """Post id -> (InputPeerChannel, discussion message id). One RPC."""
+        if time.monotonic() < self.resolve_until:
+            # Telegram already told us to wait for this exact method; asking
+            # again would only extend the wait.
+            rec.last_error = "flood kutilmoqda (GetDiscussionMessage)"
+            return None, 0
         try:
             updates = await self.client(
                 GetDiscussionMessageRequest(
@@ -202,6 +220,17 @@ class Sniper:
                     msg_id=post_id,
                 )
             )
+        except errors.FloodWaitError as exc:
+            # Method-scoped: sendMessage has its own budget, so commenting must
+            # not stop here - only the resolution has to wait.
+            seconds = float(getattr(exc, "seconds", 0) or 0)
+            self.metrics.flood_waits += 1
+            self.resolve_until = time.monotonic() + seconds + 0.5
+            rec.last_error = f"flood {int(seconds)}s (GetDiscussionMessage)"
+            log.warning(
+                "discussion so'rovi flood %ss (%s#%s)", int(seconds), rec.key, post_id
+            )
+            return None, 0
         except errors.RPCError as exc:
             log.warning("discussion topilmadi (%s#%s): %s", rec.key, post_id, exc)
             rec.last_error = f"{exc.__class__.__name__}: {exc}"[:200]

@@ -227,6 +227,10 @@ AUTO_JOIN=1
 `WORDS` — boshlang'ich komment matnlari (`|` bilan ajratiladi). Keyin `.word` buyrug'i
 bilan serverga tegmasdan o'zgartirasiz.
 
+`RESOLVE_GRACE_MS` (standart `300`) — kanal post'i muhokama guruhiga forward
+bo'lishidan oldin yetib kelsa, bot shu qadar kutib bir marta qayta so'raydi.
+`0` qo'ysangiz kutmaydi (faqat guruh update'i yetib kelganda komment ketadi).
+
 ---
 
 ## 11. Birinchi ishga tushirish (foreground)
@@ -344,6 +348,7 @@ Javobda `tez yo'l: bor (0 qo'shimcha RPC)` ko'rsangiz — bot maksimal tezlikda 
 | Alomat | Sabab / yechim |
 |---|---|
 | `FLOOD_WAIT 300s` logda | Telegram sizni tez yozayotgan deb hisobladi. Bot o'zi kutadi. `MAX_PER_MINUTE` ni kamaytiring (10–15), bir necha soat "tinchlaning". |
+| `flood Ns (GetDiscussionMessage)` | Bu metod `sendMessage`dan **alohida** limitga ega, shuning uchun kommentlash to'xtamaydi — bot faqat shu so'rov uchun pauza qo'yadi. Ko'pincha kanal keshi bo'sh bo'lganda yoki `.check` ketma-ket yuborilganda chiqadi: `.add` bilan keshni to'ldiring, `.check` ni tez-tez bosmang. |
 | `sekin rejim` (slow mode) | Guruhda slow mode bor — sizning kommentingiz jismonan bloklanadi. Bu kanal sozlamasi, kod aybi emas. |
 | Komment kelmayapti, `.info` da guruh id **bor** | `.check` yuboring: u a'zolik, yozish huquqi, slow mode va `getDiscussionMessage` ni tekshirib aniq sababni aytadi. Ko'pincha akkaunt guruhga a'zo emas (guruh id ko'rinishi a'zolikni bildirmaydi) yoki guruh faqat adminlarga yozishga ruxsat beradi. |
 | Komment kelmayapti, `.stats` da `unresolved` | Kanalda muhokama guruhi yo'q, postda kommentlar o'chirilgan yoki guruh yopiq. `.check` aniq sababni ko'rsatadi. |
