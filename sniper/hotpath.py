@@ -136,6 +136,7 @@ class Sniper:
             group_peer, reply_to = await self._resolve(rec, hit.post_id)
             if group_peer is None or not reply_to:
                 metrics.skip("unresolved")
+                rec.last_error = rec.last_error or "muhokama guruhi aniqlanmadi"
                 return
 
         text, cursor = pick(state.words, state.cursor)
@@ -160,9 +161,11 @@ class Sniper:
             if isinstance(exc, errors.SlowModeWaitError):
                 metrics.skip("slow_mode")
                 self.frozen_until = max(self.frozen_until, now + seconds)
+                rec.last_error = f"slow mode {int(seconds)}s"
                 log.warning("sekin rejim: %s guruhi %ss kutish", rec.key, int(seconds))
             else:
                 metrics.skip("flood")
+                rec.last_error = f"flood {int(seconds)}s"
                 self.frozen_until = now + seconds + 1.0
                 log.warning(
                     "FLOOD_WAIT %ss (%s) - kommentlash %ss to'xtatildi",
@@ -173,10 +176,12 @@ class Sniper:
             return
         except errors.RPCError as exc:
             metrics.failures += 1
+            rec.last_error = f"{exc.__class__.__name__}: {exc}"[:200]
             log.warning("komment yuborilmadi (%s#%s): %s", rec.key, hit.post_id, exc)
             return
-        except Exception:  # network hiccup, never kill the handler
+        except Exception as exc:  # network hiccup, never kill the handler
             metrics.failures += 1
+            rec.last_error = f"{exc.__class__.__name__}: {exc}"[:200]
             log.exception("komment yuborishda kutilmagan xato (%s)", rec.key)
             return
 
@@ -185,6 +190,7 @@ class Sniper:
         metrics.ok(hit.channel_id, reaction_ms, (prepared - started) / 1000.0)
         rec.comments += 1
         rec.last_ms = reaction_ms
+        rec.last_error = ""
 
     # ------------------------------------------------------------- slow helpers
     async def _resolve(self, rec: Any, post_id: int):
@@ -198,6 +204,7 @@ class Sniper:
             )
         except errors.RPCError as exc:
             log.warning("discussion topilmadi (%s#%s): %s", rec.key, post_id, exc)
+            rec.last_error = f"{exc.__class__.__name__}: {exc}"[:200]
             return None, 0
 
         chats = {chat.id: chat for chat in (getattr(updates, "chats", None) or ())}
@@ -212,7 +219,9 @@ class Sniper:
             rec.group_id = group_id
             rec.group_hash = chat.access_hash
             self.store.reindex()
+            rec.last_error = ""
             return types.InputPeerChannel(group_id, chat.access_hash), message.id
+        rec.last_error = "guruh xabari topilmadi (kommentlar o'chirilgan?)"
         return None, 0
 
     def _prune(self, now_ns: int) -> None:

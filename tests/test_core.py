@@ -198,9 +198,25 @@ class TestClassify(unittest.TestCase):
     def test_command_from_foreign_chat_rejected(self):
         self.assertIsNone(self.run_classify(fake_msg(channel_id=333, text=".pause", out=True)))
 
-    def test_command_requires_own_message(self):
+    def test_saved_messages_command_with_raw_out_false(self):
+        # Raw self-chat updates carry out=False (Telethon only patches this in
+        # its custom Message class, which events.Raw never builds), so Saved
+        # Messages must be recognised by the peer alone.
+        hit = self.run_classify(fake_msg(user_id=1, text=".pause", out=False), self_id=1)
+        self.assertIsInstance(hit, CommandHit)
+
+    def test_command_from_a_stranger_is_ignored(self):
         self.assertIsNone(
-            self.run_classify(fake_msg(user_id=1, text=".pause", out=False), self_id=1)
+            self.run_classify(fake_msg(user_id=2, text=".pause", out=False), self_id=1)
+        )
+        self.assertIsNone(
+            self.run_classify(fake_msg(user_id=2, text=".pause", out=True), self_id=1)
+        )
+
+    def test_allowed_chat_still_requires_our_own_message(self):
+        chats = frozenset({int("-100444")})
+        self.assertIsNone(
+            self.run_classify(fake_msg(channel_id=444, text=".stats", out=False), chats=chats)
         )
 
     def test_plain_text_is_not_command(self):
@@ -386,17 +402,68 @@ class TestCommentPath(unittest.TestCase):
         self.assertEqual(metrics.skipped.get("unresolved"), 1)
         self.assertEqual(metrics.comments, 0)
 
+    def test_send_failure_keeps_the_reason_on_the_channel(self):
+        # Without this the user only sees "xato 3" and cannot tell why.
+        sniper, _, _, store = self.build(error=errors.RPCError(None, "CHAT_WRITE_FORBIDDEN"))
+        self.run_hit(sniper)
+        error = store.state.channels["kanal"].last_error
+        self.assertTrue(error.startswith("RPCError"), error)
+        self.assertIn("CHAT_WRITE_FORBIDDEN", error)
+
+    def test_success_clears_a_previous_error(self):
+        sniper, _, _, store = self.build()
+        store.state.channels["kanal"].last_error = "eski xato"
+        self.run_hit(sniper)
+        self.assertEqual(store.state.channels["kanal"].last_error, "")
+
+
+class CheckClient(FakeClient):
+    """Answers `.check`'s RPCs with Telegram-shaped replies."""
+
+    async def get_entity(self, target):
+        return SimpleNamespace(id=50, access_hash=555, title="Kanall", broadcast=True)
+
+    async def __call__(self, request):
+        self.requests.append(request)
+        name = type(request).__name__
+        if name == "GetFullChannelRequest":
+            if request.channel.channel_id == 50:  # the channel itself
+                chat = SimpleNamespace(
+                    linked_chat_id=900,
+                    slowmode_seconds=0,
+                    default_banned_rights=None,
+                    banned_rights=None,
+                )
+            else:  # the discussion group
+                chat = SimpleNamespace(
+                    linked_chat_id=0,
+                    slowmode_seconds=30,
+                    default_banned_rights=None,
+                    banned_rights=None,
+                )
+            return SimpleNamespace(full_chat=chat)
+        if name == "GetParticipantRequest":
+            return SimpleNamespace(participant=SimpleNamespace())
+        if name == "GetHistoryRequest":
+            return SimpleNamespace(messages=[SimpleNamespace(id=42, post=True)])
+        if name == "GetDiscussionMessageRequest":
+            return SimpleNamespace(
+                messages=[SimpleNamespace(id=777, peer_id=SimpleNamespace(channel_id=900))],
+                chats=[SimpleNamespace(id=900, access_hash=999)],
+            )
+        return SimpleNamespace()
+
 
 # --------------------------------------------------------------------- commands
 class TestCommands(unittest.TestCase):
     """The chat interface: every command must answer without touching network."""
 
-    def build(self, words=("eski",)):
+    def build(self, words=("eski",), client=None):
         from sniper.commands import Commands
 
         store = Store(Path(tempfile.mkdtemp()) / "state.json")
         store.set_words(words)
-        client = FakeClient()
+        client = client or FakeClient()
         commands = Commands(
             client, fake_settings(), store, Metrics(), SimpleNamespace(frozen_until=0.0)
         )
@@ -460,6 +527,57 @@ class TestCommands(unittest.TestCase):
     def test_add_rejects_invite_links(self):
         commands, _, _ = self.build()
         self.assertIn("Foydalanish", self.send(commands, ".add https://t.me/+secret"))
+
+    def test_check_walks_through_every_blocking_condition(self):
+        from sniper.commands import Commands
+
+        store = Store(Path(tempfile.mkdtemp()) / "state.json")
+        store.set_words(("salom",))
+        store.add(
+            Channel(
+                key="kanal",
+                title="Kanall",
+                channel_id=50,
+                channel_hash=555,
+                group_id=900,
+                group_hash=999,
+            )
+        )
+        commands = Commands(
+            CheckClient(), fake_settings(), store, Metrics(), SimpleNamespace(frozen_until=0.0)
+        )
+        reply = self.send(commands, ".check")
+        self.assertIn("kanal: ochildi", reply)
+        self.assertIn("kanal a'zoligi: bor", reply)
+        self.assertIn("kommentlar: yoqilgan (guruh 900)", reply)
+        self.assertIn("guruh a'zoligi: bor", reply)
+        self.assertIn("slow mode: 30s", reply)
+        self.assertIn("yozish huquqi: bor", reply)
+        self.assertIn("guruh xabari #777 BOR", reply)
+
+    def test_check_without_channels(self):
+        commands, _, _ = self.build()
+        self.assertIn("Tekshirish uchun kanal yo'q", self.send(commands, ".check"))
+
+    def test_info_shows_the_last_send_error(self):
+        from sniper.commands import Commands
+
+        store = Store(Path(tempfile.mkdtemp()) / "state.json")
+        store.set_words(("salom",))
+        store.add(
+            Channel(
+                key="kanal",
+                channel_id=50,
+                channel_hash=555,
+                group_id=900,
+                group_hash=999,
+                last_error="ChatWriteForbiddenError: CHAT_WRITE_FORBIDDEN",
+            )
+        )
+        commands = Commands(
+            FakeClient(), fake_settings(), store, Metrics(), SimpleNamespace(frozen_until=0.0)
+        )
+        self.assertIn("xato: ChatWriteForbiddenError", self.send(commands, ".info"))
 
 
 if __name__ == "__main__":

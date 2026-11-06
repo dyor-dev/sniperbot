@@ -310,7 +310,8 @@ systemctl restart comment-sniper
 |---|---|
 | `.ping` | Telegram DC'gacha real RTT (min/p50/p95/max + jitter) |
 | `.stats` | update/post/komment soni, reaksiya vaqtlari, o'tkazib yuborilganlar |
-| `.info` | rejim, kanallar, komment matnlari, flood kutish |
+| `.info` | rejim, kanallar, komment matnlari, flood kutish, oxirgi xato |
+| `.check` yoki `.check @kanal` | nega komment ketmayotganini qadam-baqadam tekshiradi (a'zolik, huquq, slow mode, guruh xabari) |
 | `.word a\|b\|c` | matnlarni **restart qilmasdan** yangilash |
 | `.auto` yoki `.resume` | komment yozishni yoqish |
 | `.pause` | komment yozishni to'xtatish (kuzatish davom etadi) |
@@ -344,7 +345,8 @@ Javobda `tez yo'l: bor (0 qo'shimcha RPC)` ko'rsangiz — bot maksimal tezlikda 
 |---|---|
 | `FLOOD_WAIT 300s` logda | Telegram sizni tez yozayotgan deb hisobladi. Bot o'zi kutadi. `MAX_PER_MINUTE` ni kamaytiring (10–15), bir necha soat "tinchlaning". |
 | `sekin rejim` (slow mode) | Guruhda slow mode bor — sizning kommentingiz jismonan bloklanadi. Bu kanal sozlamasi, kod aybi emas. |
-| Komment kelmayapti, `.stats` da `unresolved` | Kanalda muhokama guruhi yo'q yoki guruh yopiq. `.remove` + qayta `.add`. |
+| Komment kelmayapti, `.info` da guruh id **bor** | `.check` yuboring: u a'zolik, yozish huquqi, slow mode va `getDiscussionMessage` ni tekshirib aniq sababni aytadi. Ko'pincha akkaunt guruhga a'zo emas (guruh id ko'rinishi a'zolikni bildirmaydi) yoki guruh faqat adminlarga yozishga ruxsat beradi. |
+| Komment kelmayapti, `.stats` da `unresolved` | Kanalda muhokama guruhi yo'q, postda kommentlar o'chirilgan yoki guruh yopiq. `.check` aniq sababni ko'rsatadi. |
 | `.add` "guruh topilmadi" | Guruhga a'zo bo'ling yoki `AUTO_JOIN=1` ekanini tekshiring. |
 | `Session yaroqsiz` | Session bekor qilingan (boshqa joydan logout). `scripts/login.py` bilan yangilang. |
 | `PEER_ID_INVALID` | Kesh eskirgan: `.remove @kanal` → `.add @kanal`. |
@@ -390,7 +392,7 @@ Ha, lekin foyda kamayib boradi (chunki vaqt tarmoqda):
 sniper/
   classify.py   # har update uchun 1 µs: nima qilish kerakligini aniqlaydi (tarmoqsiz)
   hotpath.py    # post -> bitta sendMessage; dedupe, flood himoyasi
-  commands.py   # .ping .stats .info .word .auto .pause .channels .add .remove
+  commands.py   # .ping .stats .info .check .word .auto .pause .channels .add .remove
   store.py      # kanallar + matnlar (atomik JSON)
   metrics.py    # hisoblagichlar va kechikish namunalari
   ratelimit.py  # per-channel / global limit

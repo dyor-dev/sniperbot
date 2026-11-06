@@ -78,11 +78,19 @@ def _is_command(msg: Any, self_id: int, command_chat_ids: frozenset[int]) -> boo
     text = msg.message
     if not text or text[0] != CMD_PREFIX:
         return False
-    if not getattr(msg, "out", False):
-        return False
+
     peer = msg.peer_id
+    # Saved Messages is the chat with ourselves: check the peer BEFORE the `out`
+    # flag. Raw updates for self-chat arrive with out=False - Telethon only
+    # rewrites that in its custom Message class (Message._finish_init), and
+    # events.Raw bypasses it. Nobody else can write into Saved Messages, so the
+    # peer alone is proof that the command is ours.
     if getattr(peer, "user_id", 0) == self_id:
         return True
+
+    # Anywhere else the message must be ours: a stranger typing ".ping" is not a command.
+    if not getattr(msg, "out", False):
+        return False
     return bool(command_chat_ids) and peer_int_id(peer) in command_chat_ids
 
 

@@ -21,6 +21,8 @@ class Channel:
     group_hash: int = 0
     comments: int = 0
     last_ms: float = 0.0
+    # Why the last comment did not go out (empty when all is well).
+    last_error: str = ""
 
 
 @dataclass

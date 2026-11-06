@@ -26,6 +26,7 @@ HELP = """COMMENT SNIPER - buyruqlar
 .ping                - Telegram DC'gacha real RTT (ms)
 .stats               - tezlik va faoliyat statistikasi
 .info                - holat, kanallar, komment matnlari
+.check [@kanal]      - nega komment ketmayotganini tekshirish
 .word a|b|c          - komment matnlarini yangilash (restart kerak emas)
 .auto | .resume      - komment yozishni yoqish
 .pause               - komment yozishni to'xtatish (kuzatish davom etadi)
@@ -82,6 +83,8 @@ class Commands:
             ".resume": self._resume,
             ".pause": self._pause,
             ".channels": self._channels,
+            ".check": self._check,
+            ".diag": self._check,
             ".add": self._add,
             ".remove": self._remove,
             ".help": self._help,
@@ -185,6 +188,7 @@ class Commands:
                 f"  @{rec.key}"
                 + (f" -> guruh {rec.group_id}" if rec.group_id else " -> guruh YO'Q")
                 + (f" · {_n(rec.comments)} komment" if rec.comments else "")
+                + (f" · xato: {rec.last_error}" if getattr(rec, "last_error", "") else "")
                 for rec in channels
             )
         else:
@@ -341,6 +345,204 @@ class Commands:
 
     async def _help(self, hit: CommandHit, argument: str) -> None:
         await self._say(hit, HELP)
+
+    # ---------------------------------------------------------------- .check
+    async def _check(self, hit: CommandHit, argument: str) -> None:
+        """Read-only self test: every reason a channel may stay silent.
+
+        Nothing here is on the hot path; it may do as many RPCs as it likes.
+        It also repairs what it can (stale access_hash, changed linked group).
+        """
+        key = normalize_channel(argument) if argument else None
+        if key and key not in self.store.state.channels:
+            await self._say(hit, f"@{key} ro'yxatda yo'q. .add @{key}")
+            return
+        records = (
+            [self.store.state.channels[key]] if key else list(self.store.state.channels.values())
+        )
+        if not records:
+            await self._say(hit, "Tekshirish uchun kanal yo'q. .add @kanal")
+            return
+
+        blocks: list[str] = []
+        changed = False
+        for rec in records[:5]:
+            text, rec_changed = await self._check_one(rec)
+            blocks.append(text)
+            changed = changed or rec_changed
+        if changed:
+            self.store.save()
+
+        lines = ["CHECK - kanal holati", ""]
+        lines.append("\n\n".join(blocks))
+        if len(records) > 5:
+            lines.append(f"\n(yana {len(records) - 5} kanal - .check @kanal)")
+        await self._say(hit, "\n".join(lines))
+
+    async def _check_one(self, rec: Channel) -> tuple[str, bool]:
+        lines = [f"@{rec.key}"]
+        changed = False
+        channel_hash = rec.channel_hash
+
+        # 1) Is the cached access_hash still valid? Refresh it by username if not.
+        try:
+            entity = await self.client.get_entity(
+                types.InputPeerChannel(rec.channel_id, channel_hash)
+            )
+            fresh = int(getattr(entity, "access_hash", 0) or 0)
+            if fresh and fresh != channel_hash:
+                rec.channel_hash = channel_hash = fresh
+                changed = True
+                lines.append("  kanal: ochildi (access_hash yangilandi)")
+            else:
+                lines.append("  kanal: ochildi")
+        except Exception:
+            try:
+                entity = await self.client.get_entity(rec.key)
+            except Exception as exc:
+                lines.append(f"  kanal: OCHILMADI ({type(exc).__name__}) - .remove + .add")
+                return self._check_text(lines, rec), changed
+            fresh = int(getattr(entity, "access_hash", 0) or 0)
+            if fresh:
+                rec.channel_hash = channel_hash = fresh
+                changed = True
+            lines.append("  kanal: username orqali ochildi (kesh yangilandi)")
+
+        channel_input = types.InputChannel(rec.channel_id, channel_hash)
+        channel_peer = types.InputPeerChannel(rec.channel_id, channel_hash)
+
+        # 2) Channel membership: Telegram sends updates only to members.
+        member = await self._is_member(channel_input)
+        lines.append(
+            "  kanal a'zoligi: "
+            + {True: "bor", False: "YO'Q (yangilanish kelmaydi)", None: "aniqlanmadi"}[member]
+        )
+
+        # 3) Are comments enabled, and is the linked group the one we stored?
+        full = None
+        try:
+            full = await self.client(
+                functions.channels.GetFullChannelRequest(channel=channel_input)
+            )
+        except Exception as exc:
+            lines.append(f"  kommentlar: aniqlanmadi ({type(exc).__name__})")
+        if full is not None:
+            linked = int(getattr(full.full_chat, "linked_chat_id", 0) or 0)
+            if linked:
+                lines.append(f"  kommentlar: yoqilgan (guruh {linked})")
+            else:
+                lines.append("  kommentlar: O'CHIRILGAN - bu kanalga komment yozib bo'lmaydi")
+            if linked and linked != rec.group_id:
+                group_id, group_hash, title = await self._find_group(channel_peer, linked)
+                if group_id:
+                    rec.group_id, rec.group_hash = group_id, group_hash
+                    rec.title = rec.title or title
+                    changed = True
+                    lines.append(f"  guruh: yangilandi -> {group_id}")
+                else:
+                    lines.append("  guruh: topilmadi (avval guruhga a'zo bo'ling)")
+        # 4) Group: membership, write rights, slow mode.
+        if rec.group_id and rec.group_hash:
+            group_input = types.InputChannel(rec.group_id, rec.group_hash)
+            group_member = await self._is_member(group_input)
+            lines.append(
+                "  guruh a'zoligi: "
+                + {
+                    True: "bor",
+                    False: "YO'Q (komment yozilmaydi - guruhga qo'shiling)",
+                    None: "aniqlanmadi",
+                }[group_member]
+            )
+            try:
+                group_full = await self.client(
+                    functions.channels.GetFullChannelRequest(channel=group_input)
+                )
+                chat = group_full.full_chat
+                slow = int(getattr(chat, "slowmode_seconds", 0) or 0)
+                if slow:
+                    lines.append(f"  slow mode: {slow}s (komment faqat {slow + 1}s dan keyin)")
+                blocked = bool(
+                    getattr(getattr(chat, "default_banned_rights", None), "send_messages", False)
+                    or getattr(getattr(chat, "banned_rights", None), "send_messages", False)
+                )
+                lines.append(
+                    "  yozish huquqi: "
+                    + ("YO'Q (faqat adminlar yozadi)" if blocked else "bor")
+                )
+            except Exception as exc:
+                lines.append(f"  guruh sozlamalari: o'qilmadi ({type(exc).__name__})")
+
+        # 5) End-to-end: newest post -> discussion message id.
+        try:
+            history = await self.client(
+                functions.messages.GetHistoryRequest(
+                    peer=channel_peer,
+                    offset_id=0,
+                    offset_date=None,
+                    add_offset=0,
+                    limit=3,
+                    max_id=0,
+                    min_id=0,
+                    hash=0,
+                )
+            )
+            posts = [
+                message
+                for message in (getattr(history, "messages", None) or ())
+                if getattr(message, "post", False)
+            ]
+        except Exception as exc:
+            posts = []
+            lines.append(f"  postlar: o'qilmadi ({type(exc).__name__})")
+
+        if posts:
+            post_id = posts[0].id
+            try:
+                updates = await self.client(
+                    functions.messages.GetDiscussionMessageRequest(
+                        peer=channel_peer, msg_id=post_id
+                    )
+                )
+            except Exception as exc:
+                lines.append(f"  post #{post_id}: XATO {type(exc).__name__}: {exc}")
+            else:
+                found = [
+                    message
+                    for message in (getattr(updates, "messages", None) or ())
+                    if getattr(getattr(message, "peer_id", None), "channel_id", 0)
+                ]
+                if found:
+                    lines.append(f"  post #{post_id}: guruh xabari #{found[0].id} BOR")
+                else:
+                    lines.append(
+                        f"  post #{post_id}: guruh xabari YO'Q "
+                        "(postda kommentlar o'chirilgan yoki guruh bog'lanmagan)"
+                    )
+        elif not lines[-1].startswith("  postlar"):
+            lines.append("  postlar: kanalda post topilmadi")
+
+        return self._check_text(lines, rec), changed
+
+    @staticmethod
+    def _check_text(lines: list[str], rec: Channel) -> str:
+        error = getattr(rec, "last_error", "")
+        if error:
+            lines.append(f"  oxirgi yuborish xatosi: {error}")
+        return "\n".join(lines)
+
+    async def _is_member(self, channel_input: Any) -> bool | None:
+        """True/False when Telegram answers, None when it refuses to tell."""
+        try:
+            await self.client(
+                functions.channels.GetParticipantRequest(
+                    channel=channel_input, participant=types.InputPeerSelf()
+                )
+            )
+            return True
+        except errors.UserNotParticipantError:
+            return False
+        except Exception:
+            return None
 
     # ------------------------------------------------------------- membership
     async def _ensure_participant(
