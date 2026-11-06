@@ -1,0 +1,5 @@
+# Core
+telethon==1.45.0
+
+# Optional but recommended: faster event loop (falls back to asyncio if missing)
+uvloop>=0.19; sys_platform == "linux"

@@ -1,0 +1,37 @@
+[Unit]
+Description=Telegram Comment Sniper (userbot)
+Documentation=file:///opt/comment-sniper/README.md
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+
+[Service]
+Type=simple
+User=sniper
+Group=sniper
+WorkingDirectory=/opt/comment-sniper
+EnvironmentFile=/opt/comment-sniper/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/comment-sniper/.venv/bin/python -m sniper
+Restart=always
+RestartSec=1
+TimeoutStopSec=10
+
+# --- latency: highest priority the kernel gives a normal-priority process ---
+Nice=-20
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+OOMScoreAdjust=-500
+LimitNOFILE=1048576
+
+# --- hardening (does not affect latency) ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/comment-sniper
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target
